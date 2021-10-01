@@ -5079,6 +5079,56 @@ size_t QuicFramer::GetIetfAckFrameSize(const QuicAckFrame& frame) {
   return ack_frame_size;
 }
 
+size_t QuicFramer::GetIetfAckFrameTimeStampSize(const QuicAckFrame& frame) {
+  size_t size = 0;
+
+  QuicIntervalSet<QuicPacketNumber> timestamp_ranges;
+  auto it = frame.received_packet_times.begin();
+  if (frame.received_packet_times.size() > max_receive_timestamps_per_ack_) {
+    // Limit the number of reported timestamps to the most recent.
+    std::advance(it, frame.received_packet_times.size() -
+                         max_receive_timestamps_per_ack_);
+  }
+  for (; it != frame.received_packet_times.end(); it++) {
+    timestamp_ranges.AddOptimizedForAppend(it->first, it->first + 1);
+  }
+  size += QuicDataWriter::GetVarInt62Len(timestamp_ranges.Size());
+
+  QuicPacketNumber prev_packet_number = LargestAcked(frame);
+  uint64_t prev_time = creation_time_.ToMicroseconds();
+
+  auto ts_it = frame.received_packet_times.rbegin();
+  for (auto range_it = timestamp_ranges.rbegin();
+       range_it != timestamp_ranges.rend(); range_it++) {
+    uint64_t gap = prev_packet_number - (range_it->max() - 1);
+    size += QuicDataWriter::GetVarInt62Len(gap);
+    size += QuicDataWriter::GetVarInt62Len(range_it->Length());
+    for (size_t i = 0; i < range_it->Length(); i++) {
+      if (range_it == timestamp_ranges.rbegin() && i == 0) {
+        // The first delta is from framer creation to the current receive
+        // timestamp (forward in time), whereas in the common case subsequent
+        // deltas move backwards in time.
+        const uint64_t epoch_mask = (UINT64_C(1) << 32) - 1;
+        const uint64_t exponent_mask =
+            (UINT64_C(1) << (receive_timestamps_exponent_ + 1)) - 1;
+        time_delta =
+            ((ts_it->second.ToMicroseconds() - prev_time) & epoch_mask_us)
+            << ietf_receive_timestamps_exponent_;
+        prev_time = (ts_it->second.ToMicroseconds() - prev_time) & exponent_mask_us
+      } else {
+        uint64_t time_delta = (prev_time - ts_it->second.ToMicroseconds())
+                              << ietf_receive_timestamps_exponent_;
+        size += QuicDataWriter::GetVarInt62Len(time_delta);
+        prev_time = prev_time - QuicTime::Delta::FromMicroseconds(epoch_delta);
+      }
+      ts_it++;
+    }
+    prev_packet_number = range_it->min();
+  }
+
+  return size;
+}
+
 size_t QuicFramer::GetAckFrameSize(
     const QuicAckFrame& ack,
     QuicPacketNumberLength /*packet_number_length*/) {
@@ -5788,6 +5838,58 @@ bool QuicFramer::AppendTimestampsToAckFrame(const QuicAckFrame& frame,
   return true;
 }
 
+bool QuicFramer::AppendIetfTimestampsToAckFrame(const QuicAckFrame& frame,
+                                                QuicDataWriter* writer) {
+  QuicIntervalSet<QuicPacketNumber> timestamp_ranges;
+  auto it = frame.received_packet_times.begin();
+  if (frame.received_packet_times.size() > max_receive_timestamps_per_ack_) {
+    // Limit the number of reported timestamps to the most recent.
+    std::advance(it, frame.received_packet_times.size() -
+                         max_receive_timestamps_per_ack_);
+  }
+  for (; it != frame.received_packet_times.end(); it++) {
+    timestamp_ranges.AddOptimizedForAppend(it->first, it->first + 1);
+  }
+
+  if (!writer->WriteVarInt62(timestamp_ranges.Size())) {
+    return false;
+  }
+
+  QuicPacketNumber prev_packet_number = LargestAcked(frame);
+  QuicTime prev_time = creation_time_;
+
+  auto ts_it = frame.received_packet_times.rbegin();
+  for (auto range_it = timestamp_ranges.rbegin();
+       range_it != timestamp_ranges.rend(); range_it++) {
+    uint64_t gap = prev_packet_number - (range_it->max() - 1);
+    if (!writer->WriteVarInt62(gap)) {
+      return false;
+    }
+    if (!writer->WriteVarInt62(range_it->Length())) {
+      return false;
+    }
+    for (size_t i = 0; i < range_it->Length(); i++) {
+      QuicTime::Delta time_delta = prev_time - ts_it->second;
+      if (range_it == timestamp_ranges.rbegin() && i == 0) {
+        // The first delta is from framer creation to the current receive
+        // timestamp (forward in time), whereas in the common case subsequent
+        // deltas move backwards in time.
+        time_delta = QuicTime::Delta::Zero() - time_delta;
+      }
+      uint32_t epoch_delta =
+          static_cast<uint32_t>(time_delta.ToMicroseconds()) >>
+          ietf_receive_timestamps_exponent_;
+      if (!writer->WriteVarInt62(epoch_delta)) {
+        return false;
+      }
+      prev_time = prev_time - QuicTime::Delta::FromMicroseconds(epoch_delta);
+      ts_it++;
+    }
+    prev_packet_number = range_it->min();
+  }
+  return true;
+}
+
 bool QuicFramer::AppendStopWaitingFrame(const QuicPacketHeader& header,
                                         const QuicStopWaitingFrame& frame,
                                         QuicDataWriter* writer) {
@@ -5825,7 +5927,10 @@ bool QuicFramer::AppendIetfAckFrameAndTypeByte(const QuicAckFrame& frame,
                                                QuicDataWriter* writer) {
   uint8_t type = IETF_ACK;
   uint64_t ecn_size = 0;
-  if (frame.ecn_counters_populated &&
+  if (max_receive_timestamps_per_ack_ > 0 &&
+      frame.received_packet_times.size() > 0) {
+    type = IETF_ACK_RECEIVE_TIMESTAMPS;
+  } else if (frame.ecn_counters_populated &&
       (frame.ect_0_count || frame.ect_1_count || frame.ecn_ce_count)) {
     // Change frame type to ACK_ECN if any ECN count is available.
     type = IETF_ACK_ECN;
@@ -5928,6 +6033,24 @@ bool QuicFramer::AppendIetfAckFrameAndTypeByte(const QuicAckFrame& frame,
     if (!writer->WriteVarInt62(frame.ecn_ce_count)) {
       set_detailed_error("No room for ecn_ce_count in ack frame");
       return false;
+    }
+  }
+
+  if (type == IETF_ACK_RECEIVE_TIMESTAMPS) {
+    // If we don't have enough available space to append all the timestamps,
+    // don't append any of them.
+    if (writer->capacity() - writer->length() >=
+        GetIetfAckFrameTimeStampSize(frame)) {
+      if (!AppendIetfTimestampsToAckFrame(frame, writer)) {
+        set_detailed_error("No room for receive timestamps in ack frame");
+        return false;
+      }
+    } else {
+      if (!writer->WriteVarInt62(0)) {
+        set_detailed_error(
+            "No room for zero-length receive timestamp list in ack frame");
+        return false;
+      }
     }
   }
 

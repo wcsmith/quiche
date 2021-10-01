@@ -8035,6 +8035,90 @@ TEST_P(QuicFramerTest, BuildAckFramePacketMaxAckBlocks) {
       "constructed packet", data->data(), data->length(), AsChars(p), p_size);
 }
 
+TEST_P(QuicFramerTest, BuildAckReceiverTimestampsFramePacket) {
+  if (!VersionHasIetfQuicFrames(framer_.transport_version())) {
+    return;
+  }
+  QuicFramerPeer::SetPerspective(&framer_, Perspective::IS_CLIENT);
+  framer_.set_max_receive_timestamps_per_ack(20);
+  QuicPacketHeader header;
+  header.destination_connection_id = FramerTestConnectionId();
+  header.reset_flag = false;
+  header.version_flag = false;
+  header.packet_number = kPacketNumber;
+
+  // Use kSmallLargestObserved to make this test finished in a short time.
+  QuicAckFrame ack_frame = InitAckFrame(kSmallLargestObserved);
+  ack_frame.ack_delay_time = QuicTime::Delta::Zero();
+  ack_frame.received_packet_times = PacketTimeVector{
+    {LargestAcked(ack_frame) - 22, CreationTimePlus(0x29ffdddd)},
+    {LargestAcked(ack_frame) - 21, CreationTimePlus(0x29ffdedd)},
+    {LargestAcked(ack_frame) - 11, CreationTimePlus(0x29ffdeed)},
+    {LargestAcked(ack_frame) - 4, CreationTimePlus(0x29ffeeed)},
+    {LargestAcked(ack_frame) - 3, CreationTimePlus(0x29ffeeee)},
+    {LargestAcked(ack_frame) - 2, CreationTimePlus(0x29ffffff)},
+  };
+
+  QuicFrames frames = {QuicFrame(&ack_frame)};
+
+  // clang-format off
+  unsigned char packet_ietf[] = {
+      // type (short header, 4 byte packet number)
+      0x43,
+      // connection_id
+      0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10,
+      // packet number
+      0x12, 0x34, 0x56, 0x78,
+
+      // frame type (IETF_ACK frame)
+      0x22,
+      // largest acked
+      kVarInt62TwoBytes + 0x12, 0x34,
+      // Zero delta time.
+      kVarInt62OneByte + 0x00,
+      // Number of additional ack blocks.
+      kVarInt62OneByte + 0x00,
+      // first ack block length.
+      kVarInt62TwoBytes + 0x12, 0x33,
+
+      // Receive timestamps range count
+      kVarInt62OneByte + 0x03,
+
+      // Timestamp range 1 (three packets).
+      // gap
+      kVarInt62OneByte + 0x02,
+      // timestamp count
+      kVarInt62OneByte + 0x03,
+      // timestamp deltas
+      kVarInt62FourBytes + 0x29, 0xff, 0xff, 0xff,
+      kVarInt62TwoBytes + 0x11, 0x11,
+      kVarInt62OneByte + 0x01,
+
+      // Timestamp range 2 (one packet).
+      // gap
+      kVarInt62OneByte + 0x07,
+      // timestamp count
+      kVarInt62OneByte + 0x01,
+      // timestamp deltas
+      kVarInt62TwoBytes + 0x10, 0x00,
+
+      // Timestamp range 3 (two packets).
+      // gap
+      kVarInt62OneByte + 0x0a,
+      // timestamp count
+      kVarInt62OneByte + 0x02,
+      // timestamp deltas
+      kVarInt62OneByte + 0x10,
+      kVarInt62TwoBytes + 0x01, 0x00,
+  };
+  // clang-format on
+
+  std::unique_ptr<QuicPacket> data(BuildDataPacket(header, frames));
+  ASSERT_TRUE(data != nullptr);
+  quiche::test::CompareCharArraysWithHexError(
+      "constructed packet", data->data(), data->length(), AsChars(packet_ietf), ABSL_ARRAYSIZE(packet_ietf));
+}
+
 TEST_P(QuicFramerTest, BuildNewStopWaitingPacket) {
   if (framer_.version().HasIetfInvariantHeader()) {
     return;
